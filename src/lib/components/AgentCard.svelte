@@ -38,7 +38,7 @@
       <div class="header-info">
         <div class="header-top">
           <span class="agent-label">{agentLabel}</span>
-          <StatusBadge status={agent.status} />
+          <StatusBadge status={agent.status} waitReason={agent.wait_reason} />
         </div>
         <div class="cwd" title={agent.cwd}>{shortenPath(agent.cwd)}</div>
       </div>

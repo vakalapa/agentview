@@ -22,4 +22,5 @@ export interface AgentInfo {
   cost_usd: number | null;
   ide: string | null;
   session_id: string | null;
+  wait_reason: string | null;
 }

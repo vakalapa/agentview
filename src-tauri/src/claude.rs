@@ -126,6 +126,45 @@ fn read_jsonl_tail(path: &PathBuf) -> Option<(ClaudeUsage, Option<String>, Optio
     last_usage.map(|u| (u, last_model, cost))
 }
 
+/// Check if the last JSONL entry is a pending tool_use (Claude waiting for approval/input)
+/// Returns Some(tool_name) if waiting, None if not
+fn detect_pending_tool_use(path: &PathBuf) -> Option<String> {
+    let mut file = fs::File::open(path).ok()?;
+    let file_len = file.metadata().ok()?.len();
+
+    // Read last 4KB — enough to get the last message
+    let seek_pos = if file_len > 4096 { file_len - 4096 } else { 0 };
+    file.seek(SeekFrom::Start(seek_pos)).ok()?;
+
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+
+    // Get the last non-empty line
+    let last_line = buf.lines().rev().find(|l| !l.trim().is_empty())?;
+
+    let msg: serde_json::Value = serde_json::from_str(last_line).ok()?;
+
+    // Check: type=assistant AND message.stop_reason=tool_use
+    if msg.get("type")?.as_str()? != "assistant" {
+        return None;
+    }
+
+    let message = msg.get("message")?;
+    if message.get("stop_reason")?.as_str()? != "tool_use" {
+        return None;
+    }
+
+    // Extract the tool name from content blocks
+    let content = message.get("content")?.as_array()?;
+    for block in content.iter().rev() {
+        if block.get("type")?.as_str()? == "tool_use" {
+            return block.get("name").and_then(|n| n.as_str()).map(|s| s.to_string());
+        }
+    }
+
+    Some("unknown".to_string())
+}
+
 /// Determine context window from model string
 fn context_window_for_model(model: &str) -> u64 {
     if model.contains("[1m]") || model.contains("1m") {
@@ -240,24 +279,35 @@ pub fn build_agent_info(session: &ClaudeSessionFile, settings: &Option<ClaudeSet
         }
     }
 
+    // Detect if Claude is waiting for tool approval or user input
+    let pending_tool = jsonl_path.as_ref().and_then(detect_pending_tool_use);
+
     // Determine status
-    let status = if !alive {
-        AgentStatus::Dead
+    let (status, wait_reason) = if !alive {
+        (AgentStatus::Dead, None)
+    } else if let Some(ref tool_name) = pending_tool {
+        // Last JSONL entry is a pending tool_use — Claude is waiting for approval/input
+        let reason = if tool_name == "AskUserQuestion" {
+            "question".to_string()
+        } else {
+            format!("permission:{}", tool_name)
+        };
+        (AgentStatus::Waiting, Some(reason))
     } else if let Some(ref jpath) = jsonl_path {
         let secs_ago = file_modified_ago(jpath).unwrap_or(999);
         if secs_ago <= 15 {
-            AgentStatus::Running
+            (AgentStatus::Running, None)
         } else if scanner::is_tty_foreground(pid) {
-            AgentStatus::Waiting
+            (AgentStatus::Waiting, Some("input".to_string()))
         } else {
-            AgentStatus::Idle
+            (AgentStatus::Idle, None)
         }
     } else {
         // No JSONL found — check if foreground
         if scanner::is_tty_foreground(pid) {
-            AgentStatus::Waiting
+            (AgentStatus::Waiting, Some("input".to_string()))
         } else {
-            AgentStatus::Idle
+            (AgentStatus::Idle, None)
         }
     };
 
@@ -276,6 +326,7 @@ pub fn build_agent_info(session: &ClaudeSessionFile, settings: &Option<ClaudeSet
         cost_usd,
         ide,
         session_id: session_id.map(|s| s.to_string()),
+        wait_reason,
     })
 }
 

@@ -39,6 +39,7 @@ pub struct AgentInfo {
     pub cost_usd: Option<f64>,
     pub ide: Option<String>,
     pub session_id: Option<String>,
+    pub wait_reason: Option<String>,
 }
 
 // --- Claude Code deserialization structs ---
@@ -178,6 +179,7 @@ mod tests {
             cost_usd: Some(0.15),
             ide: Some("vscode".to_string()),
             session_id: Some("abc-123".to_string()),
+            wait_reason: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();
@@ -205,6 +207,7 @@ mod tests {
             cost_usd: None,
             ide: None,
             session_id: None,
+            wait_reason: None,
         };
 
         let json = serde_json::to_string(&info).unwrap();

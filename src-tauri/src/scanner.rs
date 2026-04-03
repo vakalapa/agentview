@@ -9,6 +9,7 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub agent_type: AgentType,
     pub start_time: u64,
+    pub cwd: Option<String>,
 }
 
 /// Scan for running Claude and Codex CLI processes
@@ -24,9 +25,13 @@ pub fn scan_agent_processes() -> Vec<ProcessInfo> {
         let cmd: Vec<String> = process.cmd().iter().map(|s| s.to_string_lossy().to_string()).collect();
         let cmd_joined = cmd.join(" ").to_lowercase();
 
-        let agent_type = if name_lower == "claude" {
+        // Filter out Claude desktop app (Claude.app) by checking exe path
+        let exe_path = process.exe().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+        let is_desktop_app = exe_path.contains("Claude.app");
+
+        let agent_type = if name_lower == "claude" && !is_desktop_app {
             // Exact match on process name "claude" = Claude Code CLI
-            // Excludes: Claude.app, Claude Helper, osq_claude_mcp, etc.
+            // Excludes: Claude.app (desktop), Claude Helper, osq_claude_mcp, etc.
             Some(AgentType::Claude)
         } else if name_lower == "codex" || (cmd_joined.contains("/codex") && !cmd_joined.contains("codex-")) {
             Some(AgentType::Codex)
@@ -39,6 +44,7 @@ pub fn scan_agent_processes() -> Vec<ProcessInfo> {
                 pid: pid.as_u32(),
                 agent_type,
                 start_time: process.start_time(),
+                cwd: process.cwd().map(|p| p.to_string_lossy().to_string()),
             });
         }
     }
@@ -66,6 +72,25 @@ pub fn is_tty_foreground(pid: u32) -> bool {
         }
         Err(_) => false,
     }
+}
+
+/// Get the current working directory of a process via lsof (reliable on macOS)
+pub fn get_process_cwd(pid: u32) -> Option<String> {
+    let output = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+        .output()
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Output format: "p<pid>\nfcwd\nn<path>\n"
+    for line in stdout.lines() {
+        if let Some(path) = line.strip_prefix('n') {
+            if path.starts_with('/') {
+                return Some(path.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Check if a PID is still alive

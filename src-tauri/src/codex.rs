@@ -26,8 +26,8 @@ pub struct CodexThread {
     pub thread_id: String,
     pub cwd: Option<String>,
     pub rollout_path: Option<String>,
-    #[allow(dead_code)]
-    pub created_at: Option<String>,
+    pub tokens_used: u64,
+    pub model: Option<String>,
 }
 
 /// Query threads from Codex SQLite state
@@ -43,30 +43,42 @@ pub fn query_threads() -> Vec<CodexThread> {
         Err(_) => return Vec::new(),
     };
 
-    // Set busy timeout to avoid blocking
     let _ = conn.busy_timeout(std::time::Duration::from_millis(1000));
 
     let mut stmt = match conn.prepare(
-        "SELECT id, cwd, rollout_path, created_at FROM threads ORDER BY created_at DESC LIMIT 20",
+        "SELECT id, cwd, rollout_path, tokens_used, model FROM threads ORDER BY updated_at DESC LIMIT 20",
     ) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
 
-    let threads = stmt
-        .query_map([], |row| {
-            Ok(CodexThread {
-                thread_id: row.get(0)?,
-                cwd: row.get(1)?,
-                rollout_path: row.get(2)?,
-                created_at: row.get(3)?,
-            })
+    let threads = match stmt.query_map([], |row| {
+        Ok(CodexThread {
+            thread_id: row.get(0)?,
+            cwd: row.get(1)?,
+            rollout_path: row.get(2)?,
+            tokens_used: row.get::<_, i64>(3).unwrap_or(0) as u64,
+            model: row.get(4)?,
         })
-        .ok()
-        .map(|rows| rows.filter_map(|r| r.ok()).collect())
-        .unwrap_or_default();
+    }) {
+        Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+        Err(_) => Vec::new()
+    };
 
     threads
+}
+
+/// Determine context window for Codex models
+fn context_window_for_codex_model(model: &str) -> u64 {
+    if model.contains("gpt-5") {
+        1_000_000
+    } else if model.contains("gpt-4") || model.contains("o3") || model.contains("o4") {
+        200_000
+    } else if model.contains("codex-mini") {
+        200_000
+    } else {
+        200_000
+    }
 }
 
 /// Read the tail of a rollout JSONL to get token usage
@@ -121,14 +133,18 @@ pub fn build_agent_infos(
 
     // For each running Codex process, try to match with a thread
     for proc in codex_pids {
-        let cwd = "unknown".to_string();
-        let model = default_model.clone();
+        let mut model = default_model.clone();
         let mut tokens: Option<TokenUsage> = None;
         let mut context_percent: Option<f64> = None;
         let mut context_window: u64 = 200_000;
         let mut session_id: Option<String> = None;
-        let mut matched_cwd = cwd.clone();
         let mut runtime_seconds: u64 = 0;
+
+        // Use process cwd: try sysinfo first, fall back to lsof
+        let proc_cwd = proc.cwd.clone()
+            .or_else(|| scanner::get_process_cwd(proc.pid))
+            .unwrap_or_else(|| "unknown".to_string());
+        let mut matched_cwd = proc_cwd.clone();
 
         // Calculate runtime from process start time
         let now = scanner::now_epoch();
@@ -136,32 +152,35 @@ pub fn build_agent_infos(
             runtime_seconds = now.saturating_sub(proc.start_time);
         }
 
-        // Try to match a thread (best effort — use most recent thread)
-        if let Some(thread) = threads.first() {
+        // Match thread by cwd, fall back to most recent thread
+        let matched_thread = threads
+            .iter()
+            .find(|t| t.cwd.as_deref() == Some(proc_cwd.as_str()))
+            .or_else(|| threads.first());
+
+        if let Some(thread) = matched_thread {
             session_id = Some(thread.thread_id.clone());
             if let Some(ref c) = thread.cwd {
                 matched_cwd = c.clone();
             }
 
-            // Read rollout JSONL
-            if let Some(ref rollout_path) = thread.rollout_path {
-                let rpath = PathBuf::from(rollout_path);
-                if let Some((usage, cw)) = read_rollout_tail(&rpath) {
-                    context_window = cw;
-                    let total = usage.total_tokens.unwrap_or(0);
-                    let input = usage.input_tokens.unwrap_or(0);
-                    let output = usage.output_tokens.unwrap_or(0);
+            // Use model from thread if available
+            if let Some(ref m) = thread.model {
+                model = m.clone();
+            }
 
-                    context_percent = Some((total as f64 / context_window as f64) * 100.0);
-
-                    tokens = Some(TokenUsage {
-                        input_tokens: input,
-                        output_tokens: output,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        total_tokens: total,
-                    });
-                }
+            // Token data from SQLite threads.tokens_used
+            let total = thread.tokens_used;
+            if total > 0 {
+                context_window = context_window_for_codex_model(&model);
+                context_percent = Some((total as f64 / context_window as f64) * 100.0);
+                tokens = Some(TokenUsage {
+                    input_tokens: total, // Codex only tracks total
+                    output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    total_tokens: total,
+                });
             }
         }
 
@@ -185,6 +204,7 @@ pub fn build_agent_infos(
             cost_usd: None,
             ide: None,
             session_id,
+            wait_reason: None,
         });
     }
 
@@ -301,12 +321,14 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 cwd TEXT,
                 rollout_path TEXT,
-                created_at TEXT
+                tokens_used INTEGER DEFAULT 0,
+                model TEXT,
+                updated_at INTEGER
             );
-            INSERT INTO threads (id, cwd, rollout_path, created_at)
-            VALUES ('thread-1', '/home/user/project', '/tmp/rollout.jsonl', '2025-01-01T00:00:00Z');
-            INSERT INTO threads (id, cwd, rollout_path, created_at)
-            VALUES ('thread-2', '/home/user/other', NULL, '2025-01-02T00:00:00Z');",
+            INSERT INTO threads (id, cwd, rollout_path, tokens_used, model, updated_at)
+            VALUES ('thread-1', '/home/user/project', '/tmp/rollout.jsonl', 50000, 'gpt-5.4', 1704067200);
+            INSERT INTO threads (id, cwd, rollout_path, tokens_used, model, updated_at)
+            VALUES ('thread-2', '/home/user/other', NULL, 0, NULL, 1704153600);",
         )
         .unwrap();
         drop(conn);
@@ -318,7 +340,7 @@ mod tests {
         let _ = conn2.busy_timeout(std::time::Duration::from_millis(1000));
 
         let mut stmt = conn2
-            .prepare("SELECT id, cwd, rollout_path, created_at FROM threads ORDER BY created_at DESC")
+            .prepare("SELECT id, cwd, rollout_path, tokens_used, model FROM threads ORDER BY updated_at DESC")
             .unwrap();
         let threads: Vec<CodexThread> = stmt
             .query_map([], |row| {
@@ -326,7 +348,8 @@ mod tests {
                     thread_id: row.get(0)?,
                     cwd: row.get(1)?,
                     rollout_path: row.get(2)?,
-                    created_at: row.get(3)?,
+                    tokens_used: row.get::<_, i64>(3).unwrap_or(0) as u64,
+                    model: row.get(4)?,
                 })
             })
             .unwrap()

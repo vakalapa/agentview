@@ -67,6 +67,7 @@ pub fn get_agents() -> Vec<AgentInfo> {
                 cost_usd: None,
                 ide: None,
                 session_id: None,
+                wait_reason: None,
             });
         }
     }
